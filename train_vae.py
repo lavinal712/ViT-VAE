@@ -6,33 +6,35 @@ import argparse
 import logging
 import math
 import os
+import random
 from pathlib import Path
 
 import accelerate
+import datasets
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import torchvision
+import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
+from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from einops import rearrange
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPVisionConfig, CLIPVisionModel
 
 import diffusers
 from diffusers import AutoencoderKL
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
-from diffusers.utils import is_wandb_available
+from diffusers.utils import check_min_version, deprecate, is_wandb_available
+from diffusers.utils.import_utils import is_xformers_available
 
 import lpips
-from PIL import Image
 
 if is_wandb_available():
     import wandb
@@ -41,12 +43,11 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @torch.no_grad()
-def log_validation(args, repo_id, test_dataloader, vae, accelerator, weight_dtype, epoch):
+def log_validation(test_dataloader, vae, accelerator, weight_dtype, epoch):
     logger.info("Running validation... ")
 
     vae_model = accelerator.unwrap_model(vae)
     images = []
-    
     for _, sample in enumerate(test_dataloader):
         x = sample["pixel_values"].to(weight_dtype)
         reconstructions = vae_model(x).sample
@@ -70,90 +71,11 @@ def log_validation(args, repo_id, test_dataloader, vae, accelerator, weight_dtyp
                 }
             )
         else:
-            logger.warn(f"image logging not implemented for {tracker.gen_images}")
+            logger.warning(f"image logging not implemented for {tracker.gen_images}")
 
-    if args.push_to_hub:
-        try:
-            save_model_card(args, repo_id, images, repo_folder=args.output_dir)
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
-        except:
-            logger.info(f"UserWarning: Your huggingface's memory is limited. The weights will be saved only local path : {args.output_dir}")
-    
     del vae_model
     torch.cuda.empty_cache()
 
-def make_image_grid(imgs, rows, cols):
-
-    w, h = imgs[0].size
-    grid = Image.new("RGB", size=(cols * w, rows * h))
-
-    for i, img in enumerate(imgs):
-        grid.paste(img, box=(i % cols * w, i // cols * h))
-    return grid
-
-def save_model_card(
-    args,
-    repo_id: str,
-    images=None,
-    repo_folder=None,
-):
-    # img_str = ""
-    # if len(images) > 0:
-    #     image_grid = make_image_grid(images, 1, "example")
-    #     image_grid.save(os.path.join(repo_folder, "val_imgs_grid.png"))
-    #     img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
-
-    yaml = f"""
----
-license: creativeml-openrail-m
-base_model: {args.pretrained_model_name_or_path}
-datasets:
-- {args.dataset_name}
-tags:
-- stable-diffusion
-- stable-diffusion-diffusers
-- text-to-image
-- diffusers
-inference: true
----
-    """
-    model_card = f"""
-# Text-to-image finetuning - {repo_id}
-
-This pipeline was finetuned from **{args.pretrained_model_name_or_path}** on the **{args.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: Nothing: \n
-
-## Training info
-
-These are the key hyperparameters used during training:
-
-* Epochs: {args.num_train_epochs}
-* Learning rate: {args.learning_rate}
-* Batch size: {args.train_batch_size}
-* Gradient accumulation steps: {args.gradient_accumulation_steps}
-* Image resolution: {args.resolution}
-* Mixed-precision: {args.mixed_precision}
-
-"""
-    wandb_info = ""
-    if is_wandb_available():
-        wandb_run_url = None
-        if wandb.run is not None:
-            wandb_run_url = wandb.run.url
-
-    if wandb_run_url is not None:
-        wandb_info = f"""
-More information on all the CLI arguments and the environment are available on your [`wandb` run page]({wandb_run_url}).
-"""
-
-    model_card += wandb_info
-
-    with open(os.path.join(repo_folder, "README.md"), "w") as f:
-        f.write(yaml + model_card)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -163,14 +85,7 @@ def parse_args():
         "--pretrained_model_name_or_path",
         type=str,
         default=None,
-        required=False,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--pretrained_model_name_or_path_2",
-        type=str,
-        default=None,
-        required=False,
+        required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -207,16 +122,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--test_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the validation data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
         "--image_column",
         type=str,
         default="image",
@@ -224,12 +129,6 @@ def parse_args():
     )
     parser.add_argument(
         "--output_dir",
-        type=str,
-        default="outputs",
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument(
-        "--huggingface_repo",
         type=str,
         default="vae-model-finetuned",
         help="The output directory where the model predictions and checkpoints will be written.",
@@ -241,12 +140,12 @@ def parse_args():
         help="The directory where the downloaded models and datasets will be stored.",
     )
     parser.add_argument(
-        "--seed", type=int, default=21, help="A seed for reproducible training."
+        "--seed", type=int, default=None, help="A seed for reproducible training."
     )
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,#512,
+        default=512,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -255,14 +154,14 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=1,
+        default=16,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=2,
+        default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
@@ -273,14 +172,13 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1.5e-7, # Reference : Waifu-diffusion-v1-4 config
-        # default=4.5e-8,
+        default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
         "--scale_lr",
         action="store_true",
-        default=True,
+        default=False,
         help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
     )
     parser.add_argument(
@@ -330,7 +228,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=5000,
+        default=500,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -347,18 +245,9 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
-        ),
-    )
-    parser.add_argument(
         "--test_samples",
         type=int,
-        default=20,
+        default=4,
         help="Number of images to remove from training set to be used as validation.",
     )
     parser.add_argument(
@@ -377,10 +266,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
-    )
-    parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
-    parser.add_argument(
         "--kl_scale",
         type=float,
         default=1e-6,
@@ -389,38 +274,11 @@ def parse_args():
     parser.add_argument(
         "--lpips_scale",
         type=float,
-        default=5e-1,
+        default=1e-1,
         help="Scaling factor for the LPIPS metric",
     )
-    parser.add_argument(
-        "--lpips_start",
-        type=int,
-        default=50001,
-        help="Start for the LPIPS metric",
-    )
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    
-    args = parser.parse_args()
 
-    # args.mixed_precision='fp16'
-    # args.pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5"
-    # args.dataset_name="yeonsikc/sample_repeat"
-    # args.seed=21
-    # args.train_batch_size=1
-    # args.num_train_epochs=100
-    # args.learning_rate=1e-07
-    # args.output_dir="/app/output_vae"
-    # args.report_to='wandb'
-    # args.push_to_hub=True
-    # args.validation_epochs=1
-    # args.resolution=128
-    # args.use_8bit_adam=False
+    args = parser.parse_args()
 
     # Sanity checks
     if args.dataset_name is None and args.train_data_dir is None:
@@ -428,26 +286,6 @@ def parse_args():
 
     return args
 
-# train_transforms = transforms.Compose(
-#     [
-#         transforms.Resize(
-#             (128,128), interpolation=transforms.InterpolationMode.BILINEAR
-#         ),
-#         # transforms.RandomCrop(128),
-#         transforms.ToTensor(),
-#         transforms.Normalize([0.5], [0.5]),
-#     ]
-# )
-
-# def preprocess(examples):
-#     images = [image.convert("RGB") for image in examples["image"]]
-#     examples["pixel_values"] = [train_transforms(image) for image in images]
-#     return examples
-
-# def collate_fn(examples):
-#     pixel_values = torch.stack([example["pixel_values"] for example in examples])
-#     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-#     return {"pixel_values": pixel_values}
 
 def main():
     args = parse_args()
@@ -481,73 +319,13 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
-            
-        if args.push_to_hub:
-            repo_id = create_repo(
-                repo_id = Path(args.huggingface_repo).name, exist_ok=True, token=args.hub_token
-            ).repo_id
 
     # Load vae
-    try:
-        vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, weight_dtype=torch.float32
-        )
-    except:
-        vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, revision=args.revision, weight_dtype=torch.float32
-        )
-    vae_config = vae.config
-    vit = CLIPVisionModel.from_pretrained(
-        args.pretrained_model_name_or_path_2, revision=args.revision,
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, revision=args.revision
     )
-    vit_config = CLIPVisionConfig.from_pretrained(
-        args.pretrained_model_name_or_path_2, revision=args.revision,
-    )
-    downsample_factor = 2 ** (len(vae_config.down_block_types) - 1)
-    projector = torch.nn.Linear(256, 4)
-    projector_2 = torch.nn.Linear(784, 1024)
-    if args.use_ema:
-        try:
-            ema_vae = AutoencoderKL.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
-        except:
-            ema_vae = AutoencoderKL.from_pretrained(
-                args.pretrained_model_name_or_path, revision=args.revision, weight_dtype=torch.float32)
-        ema_vae = EMAModel(ema_vae.parameters(), model_cls=AutoencoderKL, model_config=ema_vae.config)
-        
     vae.requires_grad_(True)
     vae_params = vae.parameters()
-    vit.requires_grad_(False)
-    projector.requires_grad_(True)
-    projector_2.requires_grad_(True)
-
-    # `accelerate` 0.16.0 will have better support for customized saving
-    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(vae, weights, output_dir):
-            if args.use_ema:
-                ema_vae.save_pretrained(os.path.join(output_dir, "vae_ema"))
-
-            logger.info(f"{vae = }")
-            vae = vae[0]
-            vae.save_pretrained(os.path.join(output_dir, "vae"))
-
-        def load_model_hook(vae, input_dir):
-            if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "vae_ema"), AutoencoderKL)
-                ema_vae.load_state_dict(load_model.state_dict())
-                ema_vae.to(accelerator.device)
-                del load_model
-
-            # load diffusers style into model
-            load_model = AutoencoderKL.from_pretrained(input_dir, subfolder="vae")
-            vae.register_to_config(**load_model.config)
-
-            vae.load_state_dict(load_model.state_dict())
-            del load_model
-
-        accelerator.register_save_state_pre_hook(save_model_hook)
-        accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
         vae.enable_gradient_checkpointing()
@@ -559,27 +337,8 @@ def main():
             * args.train_batch_size
             * accelerator.num_processes
         )
-        
-    # Initialize the optimizer
-    if args.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes` or `pip install bitsandbytes-windows` for Windows"
-            )
 
-        optimizer_cls = bnb.optim.AdamW8bit
-    else:
-        optimizer_cls = torch.optim.AdamW
-
-    optimizer = optimizer_cls(
-        vae.parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
+    optimizer = torch.optim.AdamW(vae_params, lr=args.learning_rate)
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -623,51 +382,18 @@ def main():
             transforms.Normalize([0.5], [0.5]),
         ]
     )
-    
-    # test_transforms = transforms.Compose(
-    #     [
-    #         transforms.Resize(
-    #             args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
-    #         ),
-    #         transforms.CenterCrop(args.resolution),
-    #         transforms.ToTensor(),
-    #         transforms.Normalize([0.5], [0.5]),
-    #     ]
-    # )
 
     def preprocess(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
         return examples
 
-    # def test_preprocess(examples):
-    #     images = [image.convert("RGB") for image in examples[image_column]]
-    #     examples["pixel_values"] = [test_transforms(image) for image in images]
-    #     return examples
-
     with accelerator.main_process_first():
-        # Load test data from test_data_dir
-        if(args.test_data_dir is not None and args.train_data_dir is not None):
-            logger.info(f"load test data from {args.test_data_dir}")
-            test_dir = os.path.join(args.test_data_dir, "**")        
-            test_dataset = load_dataset(
-                "imagefolder",
-                data_files=test_dir,
-                cache_dir=args.cache_dir,
-            )
-            # Set the training transforms
-            train_dataset = dataset["train"].with_transform(preprocess)
-            test_dataset = test_dataset["train"].with_transform(preprocess)
-        # Load train/test data from train_data_dir
-        elif "test" in dataset.keys():
-            train_dataset = dataset["train"].with_transform(preprocess)
-            test_dataset = dataset["test"].with_transform(preprocess)
         # Split into train/test
-        else:
-            dataset = dataset["train"].train_test_split(test_size=args.test_samples)        
-            # Set the training transforms
-            train_dataset = dataset["train"].with_transform(preprocess)
-            test_dataset = dataset["test"].with_transform(preprocess)
+        dataset = dataset["train"].train_test_split(test_size=args.test_samples)
+        # Set the training transforms
+        train_dataset = dataset["train"].with_transform(preprocess)
+        test_dataset = dataset["test"].with_transform(preprocess)
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -680,11 +406,10 @@ def main():
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
-        num_workers=args.train_batch_size*accelerator.num_processes,
     )
 
     test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, shuffle=False, collate_fn=collate_fn, batch_size=args.train_batch_size, num_workers=1,#args.train_batch_size*accelerator.num_processes,
+        test_dataset, shuffle=True, collate_fn=collate_fn
     )
 
     lr_scheduler = get_scheduler(
@@ -695,24 +420,15 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    
-    (vae,
-        vae.encoder,
-        vae.decoder,
+    (
+        vae,
         optimizer,
         train_dataloader,
         test_dataloader,
         lr_scheduler,
     ) = accelerator.prepare(
-        vae,vae.encoder, vae.decoder, optimizer, train_dataloader, test_dataloader, lr_scheduler
+        vae, optimizer, train_dataloader, test_dataloader, lr_scheduler
     )
-
-    if args.use_ema:
-        ema_vae.to(accelerator.device)
-    
-    vit.to(accelerator.device)
-    projector.to(accelerator.device)
-    projector_2.to(accelerator.device)
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -720,7 +436,8 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    
+    vae.to(accelerator.device, dtype=weight_dtype)
+
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
@@ -751,54 +468,20 @@ def main():
     global_step = 0
     first_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            # dirs = os.listdir(args.output_dir)
-            dirs = os.listdir(args.resume_from_checkpoint)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
-
-        if path is None:
-            print(
-                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
-            )
-            args.resume_from_checkpoint = None
-        else:
-            print(f"Resuming from checkpoint {path}")
-            # accelerator.load_state(os.path.join(args.output_dir, path))
-            accelerator.load_state(os.path.join(path)) #kiml
-            global_step = int(path.split("-")[1])
-
-            resume_global_step = global_step * args.gradient_accumulation_steps
-            first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
-
     progress_bar = tqdm(
         range(global_step, args.max_train_steps),
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description("Steps")
 
-    lpips_loss_fn = lpips.LPIPS(net="alex").to(accelerator.device, dtype=weight_dtype)
+    lpips_loss_fn = lpips.LPIPS(net="alex").to(accelerator.device)
     lpips_loss_fn.requires_grad_(False)
+    lpips_loss_fn.eval()
 
     for epoch in range(first_epoch, args.num_train_epochs):
         vae.train()
-        vit.eval()
         train_loss = 0.0
-        logger.info(f"{epoch = }")
-
         for step, batch in enumerate(train_dataloader):
-            # Skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                if step % args.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
             with accelerator.accumulate(vae):
                 target = batch["pixel_values"].to(weight_dtype)
 
@@ -807,64 +490,32 @@ def main():
                     posterior = vae.module.encode(target).latent_dist
                 else:
                     posterior = vae.encode(target).latent_dist
-                
-                # z = mean                      if posterior.mode()
-                # z = mean + variable*epsilon   if posterior.sample()
-                z = posterior.sample() # Not mode()
+                z = posterior.sample()
                 if accelerator.num_processes > 1:
                     pred = vae.module.decode(z).sample
                 else:
                     pred = vae.decode(z).sample
 
                 kl_loss = posterior.kl().mean()
-                
-                # if global_step > args.mse_start:
-                #     pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                # else:
-                #     pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                
-                mse_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                
+                mse_loss = F.mse_loss(pred, target, reduction="mean")
                 with torch.no_grad():
-                    lpips_loss = lpips_loss_fn(pred.to(dtype=weight_dtype), target).mean()
-                    if not torch.isfinite(lpips_loss):
-                        lpips_loss = torch.tensor(0)
-                    
-                    image_features = vit(pixel_values=target).last_hidden_state[:, 1:, :]
-                    image_features = rearrange(image_features, "b l d -> b d l").contiguous()
-                    image_features = projector(image_features)
-                    image_features = rearrange(image_features, "b d l-> b l d").contiguous()
-                    
-                    p = vit_config.patch_size
-                    z_ = rearrange(z, "b c (h ph) (w pw) -> b (h w) (ph pw c)", ph=p, pw=p)
-                    z_ = projector_2(z_)
-                    
-                    new_loss = F.mse_loss(z_.float(), image_features.float(), reduction="mean")
+                    lpips_loss = lpips_loss_fn(pred, target).mean()
 
                 loss = (
-                    mse_loss + args.lpips_scale * lpips_loss + args.kl_scale * kl_loss + new_loss
+                    mse_loss + args.lpips_scale * lpips_loss + args.kl_scale * kl_loss
                 )
-
-                if not torch.isfinite(loss):
-                    pred_mean = pred.mean()
-                    target_mean = target.mean()
-                    logger.info("\nWARNING: non-finite loss, ending training ")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
-                    
+
                 accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(vae.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                if args.use_ema:
-                    ema_vae.step(vae.parameters())
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
@@ -884,7 +535,6 @@ def main():
                 "mse": mse_loss.detach().item(),
                 "lpips": lpips_loss.detach().item(),
                 "kl": kl_loss.detach().item(),
-                "new": new_loss.detach().item(),
             }
             accelerator.log(logs)
             progress_bar.set_postfix(**logs)
@@ -892,20 +542,16 @@ def main():
         if accelerator.is_main_process:
             if epoch % args.validation_epochs == 0:
                 with torch.no_grad():
-                    log_validation(args, repo_id, test_dataloader, vae, accelerator, weight_dtype, epoch)
+                    log_validation(test_dataloader, vae, accelerator, weight_dtype, epoch)
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         vae = accelerator.unwrap_model(vae)
-        if args.use_ema:
-            ema_vae.copy_to(vae.parameters())
         vae.save_pretrained(args.output_dir)
 
     accelerator.end_training()
 
 
 if __name__ == "__main__":
-    # torch.autograd.set_detect_anomaly(True)
     main()
-    
