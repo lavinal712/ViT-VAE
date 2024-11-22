@@ -1,1 +1,1 @@
-# ControlLoRAPlus
+# ViT-VAE
