@@ -289,7 +289,7 @@ def parse_args():
     parser.add_argument(
         "--align_scale",
         type=float,
-        default=1e-4,
+        default=1,
         help="Scaling factor for the alignment",
     )
     parser.add_argument(
@@ -383,7 +383,7 @@ def main():
             * accelerator.num_processes
         )
 
-    optimizer = torch.optim.AdamW(vae_params, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(list(vae_params) + list(projector_params), lr=args.learning_rate)
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -552,7 +552,7 @@ def main():
                 with torch.no_grad():
                     resize_target = torch.nn.functional.interpolate(target, vit.config.image_size, mode="bicubic")
                     image_features = vit(resize_target).last_hidden_state[:, 1:]
-                align_loss = F.mse_loss(project_z, image_features, reduction="mean")
+                align_loss = F.kl_div(project_z.softmax(dim=-1).log(), image_features.softmax(dim=-1), reduction="mean")
                 
                 loss = (
                     mse_loss + args.lpips_scale * lpips_loss + args.kl_scale * kl_loss + args.align_scale * align_loss

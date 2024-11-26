@@ -476,7 +476,6 @@ def main():
 
     lpips_loss_fn = lpips.LPIPS(net="alex").to(accelerator.device)
     lpips_loss_fn.requires_grad_(False)
-    lpips_loss_fn.eval()
 
     for epoch in range(first_epoch, args.num_train_epochs):
         vae.train()
